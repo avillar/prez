@@ -23,13 +23,16 @@ async def create_profiles_graph(repo) -> Graph:
         PREFIX prof: <http://www.w3.org/ns/dx/prof/>
         PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        PREFIX prez: <https://prez.dev/>
 
         CONSTRUCT {?s ?p ?o .
                     ?o ?p2 ?o2 .
                     ?o2 ?p3 ?o3 .
                     ?class ?cp ?co}
         WHERE {?s a prof:Profile ;
+                      a ?profileClass ;
                       ?p ?o
+          FILTER(?profileClass in (prez:ListingProfile, prez:ObjectProfile))
           OPTIONAL {?o ?p2 ?o2
             FILTER(ISBLANK(?o))
             OPTIONAL {?o2 ?p3 ?o3
