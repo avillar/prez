@@ -141,7 +141,7 @@ async def lifespan(app: FastAPI):
 
 
 def assemble_app(
-    root_path: str = "",
+    root_path: str = None,
     title: Optional[str] = None,
     description: Optional[str] = None,
     version: Optional[str] = None,
@@ -150,6 +150,8 @@ def assemble_app(
 ):
     _settings = local_settings if local_settings is not None else settings
 
+    if root_path is None:
+        root_path = _settings.app_root_path or ''
     if title is None:
         title = _settings.prez_title
     if version is None:
