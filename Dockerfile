@@ -54,5 +54,9 @@ WORKDIR /app
 # prez module is already built as a package and installed in $VIRTUAL_ENV as a library
 COPY main.py pyproject.toml ./
 
-ENTRYPOINT uvicorn prez.app:assemble_app --factory --host=${HOST:-0.0.0.0} --port=${PORT:-8000} --proxy-headers \
-  --forwarded-allow-ips=${FORWARDED_ALLOW_IPS} --root-path "${APP_ROOT_PATH}"
+ENTRYPOINT uvicorn prez.app:assemble_app --factory \
+  --host=${HOST:-0.0.0.0} \
+  --port=${PORT:-8000} \
+  $( [ "$(echo "$PROXY_HEADERS" | tr '[:upper:]' '[:lower:]')" = "true" ] || [ "$PROXY_HEADERS" = "1" ] && echo "--proxy-headers" ) \
+  --forwarded-allow-ips=${FORWARDED_ALLOW_IPS:-127.0.0.1} \
+  --root-path "${APP_ROOT_PATH}"
