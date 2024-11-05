@@ -109,7 +109,10 @@ async def get_uri_for_curie_id(curie_id: str):
         return result
     else:
         separator = settings.curie_separator
-        curie = curie_id.replace(separator, ":")
+        if not separator in curie_id and not ':' in curie_id:
+            curie = curie_id + ':'
+        else:
+            curie = curie_id.replace(separator, ":")
         try:
             uri = prefix_graph.namespace_manager.expand_curie(curie)
         except ValueError:
