@@ -1,41 +1,46 @@
 import json
+import logging
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, Request, HTTPException
+from fastapi import Depends, HTTPException, Request
 from pyoxigraph import Store
-from rdflib import Dataset, URIRef, Graph, SKOS, RDF
+from rdflib import DCTERMS, RDF, SKOS, Dataset, Literal, URIRef
 from sparql_grammar_pydantic import IRI, Var
 
 from prez.cache import (
-    store,
-    oxrdflib_store,
-    system_store,
-    profiles_graph_cache,
-    endpoints_graph_cache,
     annotations_store,
+    endpoints_graph_cache,
+    oxrdflib_store,
     prez_system_graph,
+    profiles_graph_cache,
     queryable_props,
+    store,
+    system_store,
 )
 from prez.config import settings
 from prez.enums import (
-    NonAnnotatedRDFMediaType,
-    SPARQLQueryMediaType,
-    JSONMediaType,
     GeoJSONMediaType,
+    JSONMediaType,
+    NonAnnotatedRDFMediaType,
+    SearchMethod,
+    SPARQLQueryMediaType,
 )
 from prez.exceptions.model_exceptions import NoEndpointNodeshapeException, URINotFoundException
+from prez.enums import SearchMethod
 from prez.models.query_params import QueryParams
-from prez.reference_data.prez_ns import ALTREXT, ONT, EP, OGCE, OGCFEAT
-from prez.repositories import PyoxigraphRepo, RemoteSparqlRepo, OxrdflibRepo, Repo
+from prez.reference_data.prez_ns import ALTREXT, EP, OGCE, OGCFEAT, ONT
+from prez.repositories import OxrdflibRepo, PyoxigraphRepo, RemoteSparqlRepo, Repo
 from prez.services.classes import get_classes_single
 from prez.services.connegp_service import NegotiatedPMTs
 from prez.services.curie_functions import get_uri_for_curie_id
 from prez.services.query_generation.concept_hierarchy import ConceptHierarchyQuery
 from prez.services.query_generation.cql import CQLParser
-from prez.services.query_generation.search import SearchQueryRegex
-from prez.services.query_generation.shacl import NodeShape
-from prez.services.query_generation.sparql_escaping import escape_for_lucene_and_sparql
+from prez.services.query_generation.search_default import SearchQueryRegex
+from prez.services.query_generation.search_fuseki_fts import SearchQueryFusekiFTS
+from prez.services.query_generation.shacl import NodeShape, PropertyShape
+
+logger = logging.getLogger(__name__)
 
 
 async def get_async_http_client():
@@ -124,6 +129,9 @@ async def load_system_data_to_oxigraph(store: Store):
     endpoints_bytes = endpoints_graph_cache.serialize(format="nt", encoding="utf-8")
     store.load(endpoints_bytes, "application/n-triples")
 
+    prez_system_graph_bytes = prez_system_graph.serialize(format="nt", encoding="utf-8")
+    store.load(prez_system_graph_bytes, "application/n-triples")
+
 
 async def load_annotations_data_to_oxigraph(store: Store):
     """
@@ -180,28 +188,90 @@ async def cql_get_parser_dependency(
             return cql_parser
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON format.")
-        except Exception as e:
+        except Exception:
             raise HTTPException(
                 status_code=400, detail="Invalid CQL format: Parsing failed."
             )
 
 
-async def generate_search_query(request: Request):
+async def get_jena_fts_shacl_predicates(system_repo: Repo):
+    query = "DESCRIBE ?fts_shape WHERE {?fts_shape a <https://prez.dev/ont/JenaFTSPropertyShape>}"
+    return await system_repo.rdf_query_to_graph(query)
+
+
+async def generate_search_query(
+    request: Request,
+    system_repo: Repo = Depends(get_system_repo),
+):
     term = request.query_params.get("q")
     if term:
-        escaped_term = escape_for_lucene_and_sparql(term)
+        # escaped_term = escape_for_lucene_and_sparql(term)
         predicates = request.query_params.getlist("predicates")
         page = request.query_params.get("page", 1)
         limit = request.query_params.get("limit")
         limit = int(limit) if limit else settings.search_count_limit
         offset = limit * (int(page) - 1)
 
-        return SearchQueryRegex(
-            term=escaped_term,
-            predicates=predicates,
-            limit=limit,
-            offset=offset,
-        )
+        if settings.search_method == SearchMethod.DEFAULT:
+            search_query = SearchQueryRegex(
+                term=term,
+                predicates=predicates,
+                limit=limit,
+                offset=offset,
+            )
+        elif settings.search_method == SearchMethod.FTS_FUSEKI:
+            predicates = predicates if predicates else settings.search_predicates
+            shacl_shapes = await get_jena_fts_shacl_predicates(system_repo)
+            shacl_shape_ids = list(
+                [
+                    str(x)
+                    for x in shacl_shapes.objects(
+                        subject=None, predicate=DCTERMS.identifier
+                    )
+                ]
+            )
+            tssp_lists = []
+            tss_list = []
+            non_shacl_predicates = []
+            i = 100
+            for pred in predicates:
+                if str(pred) in shacl_shape_ids:
+                    shacl_shape_uri = shacl_shapes.value(
+                        subject=None, predicate=DCTERMS.identifier, object=Literal(pred)
+                    )
+                    shacl_shape_g = shacl_shapes.cbd(shacl_shape_uri)
+                    search_preds = list(
+                        shacl_shape_g.objects(
+                            subject=None, predicate=ONT.searchPredicate
+                        )
+                    )
+                    ps = PropertyShape(
+                        uri=shacl_shape_uri,
+                        graph=shacl_shape_g,
+                        kind="fts",
+                        focus_node=Var(value="focus_node"),
+                        shape_number=i,
+                    )
+                    tssp_lists.append((ps.tssp_list, search_preds))
+                    tss_list.extend(ps.tss_list)
+                    i += 1
+                else:
+                    non_shacl_predicates.append(pred)
+
+            search_query = SearchQueryFusekiFTS(
+                term=term,
+                non_shacl_predicates=non_shacl_predicates,
+                shacl_tssp_preds=tssp_lists,
+                tss_list=tss_list,
+                limit=limit,
+                offset=offset,
+            )
+        else:
+            raise NotImplementedError(
+                f"Search method {settings.search_method} not implemented"
+            )
+        logger.debug(f"Generated search query: {search_query}")
+        return search_query
 
 
 async def get_endpoint_uri_type(
@@ -357,7 +427,7 @@ async def get_endpoint_nodeshapes(
     """
     node_selection_shape_uri = None
     relevant_ns_query = f"""SELECT ?ns ?tc
-                            WHERE {{ 
+                            WHERE {{
                                 {ep_uri.n3()} <https://prez.dev/ont/relevantShapes> ?ns .
                                 ?ns <http://www.w3.org/ns/shacl#targetClass> ?tc ;
                                     <https://prez.dev/ont/hierarchyLevel> {hierarchy_level} .
@@ -596,6 +666,7 @@ async def check_unknown_params(request: Request):
         "filter",
         "order_by",
         "order_by_direction",
+        "subscription-key",
     }
     unknown_params = set(request.query_params.keys()) - known_params
     if unknown_params:
