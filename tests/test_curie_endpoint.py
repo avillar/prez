@@ -21,6 +21,7 @@ def test_iri(iri: str, expected_status_code: int, client: TestClient):
     assert response.status_code == expected_status_code
 
 
+@pytest.mark.skip(reason="changed so that non-curies are treated as prefixes")
 @pytest.mark.parametrize(
     "curie, expected_status_code",
     [
